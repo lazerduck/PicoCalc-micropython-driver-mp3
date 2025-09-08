@@ -1,0 +1,9 @@
+cmake .. \
+  -DUSER_C_MODULES="/home/skyli/pico/PicoCalc-micropython-driver-mp3/picocalcdisplay/micropython.cmake;/home/skyli/pico/PicoCalc-micropython-driver-mp3/vtterminal/micropython.cmake;/home/skyli/pico/PicoCalc-micropython-driver-mp3/mp3player/micropython.cmake" \
+  -DMICROPY_BOARD=RPI_PICO2
+
+  cmake .. \
+  -DUSER_C_MODULES="/home/skyli/pico/PicoCalc-micropython-driver-mp3/picocalcdisplay/micropython.cmake; \
+/home/skyli/pico/PicoCalc-micropython-driver-mp3/vtterminal/micropython.cmake; \
+/home/skyli/pico/PicoCalc-micropython-driver-mp3/mp3player/micropython.cmake" \
+  -DMICROPY_BOARD=RPI_PICO2
