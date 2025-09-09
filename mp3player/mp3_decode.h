@@ -23,3 +23,6 @@ int mp3_decoder_decode(mp3_decoder_t* dec, int16_t* out_interleaved, size_t max_
 
 // Optional: reset/seek-to-beginning
 bool mp3_decoder_rewind(mp3_decoder_t* dec);
+
+// Returns true if decoder reached end-of-file (no more data to read)
+bool mp3_decoder_is_eof(mp3_decoder_t* dec);

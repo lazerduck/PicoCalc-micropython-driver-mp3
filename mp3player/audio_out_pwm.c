@@ -15,8 +15,8 @@
 
 // ===== Config =====
 #define AUDIO_PWM_TOP           1023u  // 8-bit PWM
-#define AUDIO_BATCH_FRAMES      256u   // DMA burst size (per buffer)
-#define AUDIO_NUM_BUFFERS       2u     // ping-pong
+#define AUDIO_BATCH_FRAMES      256u   // ~5.8ms @44.1kHz for lower latency and smoother refill
+#define AUDIO_NUM_BUFFERS       2u
 
 // ===== Internal state =====
 typedef struct {
@@ -34,18 +34,17 @@ typedef struct {
     uint16_t       buf_l[AUDIO_NUM_BUFFERS][AUDIO_BATCH_FRAMES];
     uint16_t       buf_r[AUDIO_NUM_BUFFERS][AUDIO_BATCH_FRAMES];
 
-    // Which buffer is currently being played by DMA, and which is being filled
-    volatile uint  play_idx;    // 0 or 1
-    volatile uint  fill_idx;    // 0 or 1
-
-    // How many frames have been written into the fill buffer so far
-    volatile uint  fill_count;
-
-    // Flag set in DMA IRQ when a buffer finishes -> swap needed
+    volatile uint  play_idx;
+    volatile uint  fill_idx;
     volatile bool  dma_batch_done;
-
-    // Running flag
     bool           started;
+
+    // Provider callback (pull model)
+    audio_out_provider_t provider;
+    void*         provider_user;
+
+    // Simple underrun counter for diagnostics
+    volatile uint32_t underruns;
 } audio_state_t;
 
 static audio_state_t s = {0};
@@ -96,13 +95,55 @@ static inline volatile uint16_t* pwm_cc_addr_high(uint slice) {
     return ((volatile uint16_t*)&pwm_hw->slice[slice].cc) + 1;   // high half = B
 }
 
+// Forward declaration (defined later)
+static void audio_kick_dma_pair(uint buf_index);
+
 // DMA IRQ: fires when LEFT channel finishes moving one batch.
 // We keep RIGHT in lockstep; so one IRQ is enough.
+static void audio_fill_buffer(uint buf_index) {
+    if (!s.provider) {
+        // fill silence
+        for (size_t i=0;i<AUDIO_BATCH_FRAMES;i++){
+            s.buf_l[buf_index][i] = AUDIO_PWM_TOP/2;
+            s.buf_r[buf_index][i] = AUDIO_PWM_TOP/2;
+        }
+        return;
+    }
+    // Temporary small stack buffer to ask provider for frames then convert
+    int16_t tmp[2 * AUDIO_BATCH_FRAMES];
+    size_t got = s.provider(tmp, AUDIO_BATCH_FRAMES, s.provider_user);
+    if (got < AUDIO_BATCH_FRAMES) {
+        s.underruns++;
+    }
+    // Convert frames we have; if underrun, repeat last sample for remainder
+    int16_t last_l = 0, last_r = 0;
+    if (got) { last_l = tmp[0]; last_r = tmp[1]; }
+    for (size_t i = 0; i < AUDIO_BATCH_FRAMES; ++i) {
+        int16_t l, r;
+        if (i < got) {
+            if (s.channels == 2) { l = tmp[2*i]; r = tmp[2*i+1]; }
+            else { l = r = tmp[i]; }
+            last_l = l; last_r = r;
+        } else {
+            l = last_l; r = last_r; // stretch last sample
+        }
+        s.buf_l[buf_index][i] = pcm16_to_level(l);
+        s.buf_r[buf_index][i] = pcm16_to_level(r);
+    }
+}
+
 static void __isr audio_dma_irq(void) {
-    // Clear IRQ for our left channel
     if (dma_hw->ints1 & (1u << s.dma_l)) {
         dma_hw->ints1 = (1u << s.dma_l);
-        s.dma_batch_done = true;
+        // Buffer just consumed:
+        uint finished = s.play_idx;
+        // Next buffer already prepared:
+        uint next = finished ^ 1u;
+        // Start DMA on next buffer first (minimize gap)
+        audio_kick_dma_pair(next);
+        s.play_idx = next;
+        // Refill the freed buffer for future cycle
+        audio_fill_buffer(finished);
     }
 }
 
@@ -154,31 +195,36 @@ bool audio_out_init(const audio_out_cfg_t* cfg) {
     irq_set_enabled(DMA_IRQ_1, true);
     dma_channel_set_irq1_enabled(s.dma_l, true);
 
-    // Pre-fill both ping-pong buffers with silence
     for (uint b = 0; b < AUDIO_NUM_BUFFERS; ++b) {
         for (uint i = 0; i < AUDIO_BATCH_FRAMES; ++i) {
-            s.buf_l[b][i] = AUDIO_PWM_TOP / 2;
-            s.buf_r[b][i] = AUDIO_PWM_TOP / 2;
+            s.buf_l[b][i] = AUDIO_PWM_TOP/2;
+            s.buf_r[b][i] = AUDIO_PWM_TOP/2;
         }
     }
-    s.play_idx   = 0;
-    s.fill_idx   = 1;
-    s.fill_count = 0;
+    s.play_idx = 0;
+    s.fill_idx = 1;
     s.dma_batch_done = false;
     s.started = false;
+    s.provider = NULL;
+    s.provider_user = NULL;
+    s.underruns = 0;
 
     return true;
 }
 
+void audio_out_set_provider(audio_out_provider_t cb, void* user) {
+    s.provider = cb;
+    s.provider_user = user;
+}
+
 void audio_out_start(void) {
     if (s.started) return;
-
-    // Start with buffer 0 playing (silence) while buffer 1 gets filled
-    audio_kick_dma_pair(0);
-
-    // Enable PWM slice (starts generating DREQs)
+    // Prefill both buffers before start
+    audio_fill_buffer(0);
+    audio_fill_buffer(1);
+    s.play_idx = 0;
+    audio_kick_dma_pair(s.play_idx);
     pwm_set_enabled(s.slice, true);
-
     s.started = true;
 }
 
@@ -198,48 +244,8 @@ void audio_out_stop(void) {
     s.started = false;
 }
 
+uint32_t audio_out_underruns(void){ return s.underruns; }
+
 // Feed decoded interleaved frames into the "fill" buffer.
 // Returns frames accepted (may be < frames if buffer is full).
-size_t audio_out_push_interleaved(const int16_t* lr, size_t frames) {
-    if (!s.started) return 0; // we expect start() to be called first
-
-    // If the DMA finished a batch, swap play/fill roles and restart DMA.
-    if (s.dma_batch_done) {
-        s.dma_batch_done = false;
-
-        // The buffer that just finished is now our new fill buffer.
-        s.fill_idx = s.play_idx;
-        s.fill_count = 0;
-
-        // Flip play buffer and kick DMA on the other one.
-        s.play_idx ^= 1u;
-        audio_kick_dma_pair(s.play_idx);
-    }
-
-    // Fill as much as we can into the current fill buffer.
-    size_t can_accept = (AUDIO_BATCH_FRAMES - s.fill_count);
-    size_t to_take = frames < can_accept ? frames : can_accept;
-
-    if (to_take) {
-        uint16_t* L = s.buf_l[s.fill_idx] + s.fill_count;
-        uint16_t* R = s.buf_r[s.fill_idx] + s.fill_count;
-
-        if (s.channels == 2) {
-            for (size_t i = 0; i < to_take; ++i) {
-                int16_t l = lr[2*i + 0];
-                int16_t r = lr[2*i + 1];
-                L[i] = pcm16_to_level(l);
-                R[i] = pcm16_to_level(r);
-            }
-        } else {
-            for (size_t i = 0; i < to_take; ++i) {
-                int16_t m = lr[i];
-                uint16_t lv = pcm16_to_level(m);
-                L[i] = lv; R[i] = lv;
-            }
-        }
-        s.fill_count += (uint)to_take;
-    }
-
-    return to_take;
-}
+// Push/free API removed in pull model.
