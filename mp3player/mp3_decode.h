@@ -26,3 +26,6 @@ bool mp3_decoder_rewind(mp3_decoder_t* dec);
 
 // Returns true if decoder reached end-of-file (no more data to read)
 bool mp3_decoder_is_eof(mp3_decoder_t* dec);
+
+// Optional diagnostics: number of successful frames decoded and zero (scan) returns
+void mp3_decoder_get_diag(mp3_decoder_t* dec, uint32_t* frames, uint32_t* zero_returns);

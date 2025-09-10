@@ -22,3 +22,4 @@ void   audio_out_stop(void);
 
 // (Legacy push/free API removed in pull-model; keep stubs if needed.)
 uint32_t audio_out_underruns(void);
+uint32_t audio_out_actual_rate(void);
